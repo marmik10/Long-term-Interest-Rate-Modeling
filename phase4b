@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Phase 4B: restricted, JOINT AFNS Kalman maximum likelihood and OOS forecasts.
+
+Uses the 1Y–30Y MONTHLY fitted zero-coupon yields saved by Phase 1.
+
+AFNS risk-neutral dynamics:
+    dX = -K_Q X dt + Sigma dW_Q
+    K_Q = [[0,0,0],[0,lam,-lam],[0,0,lam]], r = X_level + X_slope
+    y(t,tau) = L_NS(tau) X_t - Var_Q[int_t^(t+tau) r_s ds]/(2*tau)
+
+Physical (historical) factor dynamics, restricted to diagonal K_P:
+    dX = K_P (theta_P - X) dt + Sigma dW_P
+    K_P = diag(kappa_1, kappa_2, kappa_3), each kappa > 0
+
+Measurement y_obs = y_model + eps, eps~N(0, sigma_meas^2 I_30).
+We jointly estimate theta_P, diagonal K_P, the Cholesky matrix Sigma, and
+sigma_meas using Gaussian Kalman-filter maximum likelihood on ONLY the first
+96 months. Thereafter these parameters are FROZEN; we filter sequentially,
+then forecast 1/3/6-month yields without looking ahead.
+
+This is a deliberately RESTRICTED AFNS model, not a fully general P-measure
+K_P or realistic cross-maturity measurement-error specification. The GSW
+curves being modeled are themselves fitted estimates, not observed trades.
+One fixed lambda is predetermined (.25/year) from earlier research; it was
+examined using the full sample, so the new OOS exercise is not a completely
+untouched model-design holdout. All rates are in DECIMALS internally.
+
+Usage:
+    python3 project2_phase4b_afns_kalman.py
+    python3 project2_phase4b_afns_kalman.py --maxiter 250
+    python3 project2_phase4b_afns_kalman.py --input path/to/monthly_zero_yields_pct.csv
+
+Requires: numpy, pandas, scipy, matplotlib.
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from numpy.polynomial.legendre import leggauss
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+HERE = Path(__file__).resolve().parent
+TAUS = np.arange(1., 31.)
+COLUMNS = [f'{n}Y' for n in range(1, 31)]
+DT = 1./12.
+TRAIN = 96
+HORIZONS = (1, 3, 6)
+I3 = np.eye(3)
+
+
+def ns_loadings(tau, lam):
+    tau = np.asarray(tau, dtype=float)
+    x = lam*tau
+    # x >= 0.25, no near-zero division problem for selected tenors.
+    slope = -np.expm1(-x)/x
+    return np.column_stack([np.ones(len(tau)), slope, slope-np.exp(-x)])
+
+
+def precompute_variance_basis(tau, lam, nquad=60):
+    """Q price adjustment = -0.5/tau * sum_ij Omega_ij * J_ij(tau).
+
+    J_ij(tau)=integral_0^tau B_i(s) B_j(s) ds,
+    B(s)=s * NS_loadings(s,lambda).
+    """
+    roots, weights = leggauss(nquad)
+    basis = np.empty((len(tau), 3, 3))
+    for k, t in enumerate(tau):
+        s = t*(roots+1)/2
+        x = lam*s
+        slope = -np.expm1(-x)/x
+        L = np.column_stack([np.ones(len(s)), slope, slope-np.exp(-x)])
+        B = s[:, None]*L
+        basis[k] = (t/2) * np.einsum('n,ni,nj->ij', weights, B, B)
+    return basis
+
+
+def adjustment(omega, basis, tau):
+    return -0.5*np.einsum('nij,ij->n',basis,omega)/tau
+
+
+def load_yields(path):
+    if not path.exists():
+        raise FileNotFoundError(f'Phase 1 yields missing: {path}')
+    frame = pd.read_csv(path, index_col=0, parse_dates=[0]).sort_index()
+    if not set(COLUMNS).issubset(frame.columns):
+        raise ValueError('Missing some yield columns 1Y...30Y')
+    frame = frame[COLUMNS].astype(float)
+    a = frame.to_numpy()
+    if len(a) < 120 or not np.isfinite(a).all() or np.max(np.abs(a)) > 30:
+        raise ValueError('Need at least 120 months of reasonable PERCENT yields')
+    periods = frame.index.to_period('M')
+    expected = pd.period_range(periods[0],periods[-1],freq='M')
+    if frame.index.has_duplicates or not periods.equals(expected):
+        raise ValueError('Expected distinct, contiguous monthly observations')
+    return frame, a/100.
+
+
+def unpack(p):
+    theta = np.asarray(p[:3])/100.     # entered in percentage points
+    kappa = np.exp(p[3:6])
+    sig_diag = np.exp(p[6:9])
+    low = np.diag(sig_diag)
+    low[1,0] = p[9] * 0.01
+    low[2,0] = p[10] * 0.01
+    low[2,1] = p[11] * 0.01
+    omega = low@low.T
+    meas_sd = np.exp(p[12])
+    return theta,kappa,low,omega,meas_sd
+
+
+def discrete_dynamics(theta,kappa,omega):
+    ksum=kappa[:,None]+kappa[None,:]
+    f=np.exp(-kappa*DT)
+    q=omega*(-np.expm1(-ksum*DT))/ksum
+    stationary=omega/ksum
+    return f,q,stationary
+
+
+def kalman(p, yields, H, basis, keep_states=False):
+    """Exact Gaussian innovations likelihood via 3x3 information updates.
+
+    R = measurement_sd^2 * I, so 30x30 innovation inversion is avoided.
+    Identity: det(R + HPH') = det(R) det(P) det(P^-1+H'R^-1 H).
+    """
+    theta,kappa,sigma,omega,meas_sd=unpack(p)
+    n,m=yields.shape
+    f,q,P=discrete_dynamics(theta,kappa,omega)
+    adj=adjustment(omega,basis,TAUS)
+    r=meas_sd**2
+    HtH=H.T@H
+    Ht=H.T
+    state=theta.copy()
+    nll=0.
+    filtered=np.empty((n,3)) if keep_states else None
+    fitted=np.empty((n,m)) if keep_states else None
+    for t in range(n):
+        if t:
+            state=theta+f*(state-theta)
+            P=f[:,None]*P*f[None,:]+q
+        P=(P+P.T)/2
+        cp=cho_factor(P,lower=True,check_finite=False)
+        J=cho_solve(cp,I3,check_finite=False)+HtH/r
+        cj=cho_factor(J,lower=True,check_finite=False)
+        # innovation at time t uses state predicted from t-1, no current
+        # data have entered this forecast yet.
+        residual=yields[t]-adj-H@state
+        v=Ht@residual/r
+        Jinv_v=cho_solve(cj,v,check_finite=False)
+        quad=float((residual@residual)/r-v@Jinv_v)
+        if quad < -1.e-7:
+            raise FloatingPointError('Negative Kalman innovation quadratic')
+        logdetP=2*np.log(np.diag(cp[0])).sum()
+        logdetJ=2*np.log(np.diag(cj[0])).sum()
+        nll += 0.5*(m*np.log(2*np.pi)+m*np.log(r)+logdetP+logdetJ+max(0.,quad))
+        state += Jinv_v
+        P=cho_solve(cj,I3,check_finite=False)
+        if keep_states:
+            filtered[t]=state
+            fitted[t]=H@state+adj
+    if not np.isfinite(nll):
+        raise FloatingPointError('Non-finite Kalman likelihood')
+    return (nll,filtered,fitted,adj) if keep_states else nll
+
+
+def initial_guess(y,H):
+    x=np.linalg.lstsq(H,y.T,rcond=None)[0].T
+    theta=x.mean(axis=0)
+    prev=x[:-1]-theta
+    nxt=x[1:]-theta
+    phi=np.sum(prev*nxt,axis=0)/np.maximum(np.sum(prev**2,axis=0),1e-14)
+    phi=np.clip(phi,0.6,0.995)
+    kappa=-np.log(phi)/DT
+    innovations=(x[1:]-theta)-(x[:-1]-theta)*phi
+    omega=np.cov(innovations,rowvar=False)/DT
+    evals,evecs=np.linalg.eigh(omega)
+    omega=(evecs*np.maximum(evals,(0.00015)**2))@evecs.T
+    low=np.linalg.cholesky(omega)
+    rmse=np.sqrt(np.mean((y-H@theta)**2))
+    meas=min(0.004,max(0.0003,rmse*0.15))
+    return np.r_[theta*100,np.log(kappa),np.log(np.diag(low)),
+                 low[1,0]/.01,low[2,0]/.01,low[2,1]/.01,np.log(meas)]
+
+
+def optimize_train(y,H,basis,maxiter,verbosity=True):
+    p0=initial_guess(y,H)
+    bounds=[(-25.,25.)]*3 + [(np.log(.005),np.log(3.))]*3 + \
+           [(np.log(.0001),np.log(.025))]*3 + [(-2.5,2.5)]*3 + \
+           [(np.log(.00002),np.log(.015))]
+    p0=np.array([np.clip(v,a+1e-6,b-1e-6) for v,(a,b) in zip(p0,bounds)])
+    calls=[0]
+    def objective(p):
+        calls[0]+=1
+        try: return float(kalman(p,y,H,basis))
+        except (ValueError,np.linalg.LinAlgError,FloatingPointError): return 1e12
+    start_ll=objective(p0)
+    if verbosity:
+        print(f'Initial negative log-likelihood: {start_ll:.3f}; optimizing {len(p0)} parameters')
+    result=minimize(objective,p0,method='L-BFGS-B',bounds=bounds,
+                    options={'maxiter':maxiter,'maxfun':max(2500,30*maxiter),
+                             'ftol':1e-10,'gtol':1e-4,'maxls':25})
+    if not np.isfinite(result.fun) or result.fun>=1e11:
+        raise RuntimeError('Kalman optimization failed: invalid likelihood')
+    if verbosity:
+        print(f'Final negative log-likelihood: {result.fun:.3f}; '
+              f'iterations={result.nit}, evaluations={calls[0]}')
+        print(f'Optimizer status: {result.message}')
+        if not result.success: print('WARNING: No optimizer convergence certificate. Treat parameters as provisional.')
+    return result,start_ll
+
+
+def forecasting(y, states, p, H, adj, start):
+    theta,kappa,_,_,_=unpack(p)
+    forecasts=[]
+    for horizon in HORIZONS:
+        factor_decay=np.exp(-kappa*DT*horizon)
+        for origin in range(start-1, len(y)-horizon):
+            statehat=theta+factor_decay*(states[origin]-theta)
+            pred=H@statehat+adj
+            actual=y[origin+horizon]
+            rw=y[origin]
+            for j,tau in enumerate(TAUS.astype(int)):
+                forecasts.append((origin,origin+horizon,horizon,tau,
+                                  actual[j]*100,pred[j]*100,rw[j]*100))
+    return pd.DataFrame(forecasts,columns=['origin_row','target_row','horizon_months',
+                                          'tenor_years','actual_pct','AFNS_pct','RW_pct'])
+
+
+def scored(forecast):
+    pieces=[]
+    for h,dfh in forecast.groupby('horizon_months'):
+        for tenor in [2,5,10,20,30,'ALL_30']:
+            g=dfh if tenor=='ALL_30' else dfh[dfh.tenor_years==tenor]
+            err_af=100*(g.AFNS_pct-g.actual_pct)
+            err_rw=100*(g.RW_pct-g.actual_pct)
+            af=float(np.sqrt(np.mean(err_af**2)))
+            rw=float(np.sqrt(np.mean(err_rw**2)))
+            pieces.append((h,str(tenor)+'Y' if isinstance(tenor,int) else tenor,
+                           af,rw,100*(1-af/rw),len(g.origin_row.unique())))
+    return pd.DataFrame(pieces,columns=['horizon_months','tenor',
+                                       'afns_rmse_bps','rw_rmse_bps',
+                                       'improvement_vs_rw_pct','forecast_origins'])
+
+
+def make_plots(out, df, y, H, fitted, states, adj, pars, forecasts, metrics):
+    idx=df.index
+    train_end=idx[TRAIN-1]
+    fig,ax=plt.subplots(figsize=(10,4.6))
+    ax.plot(TAUS,y[-1]*100,label='Observed GSW')
+    ax.plot(TAUS,fitted[-1]*100,label='AFNS filtered fit')
+    ax.set(xlabel='Maturity (years)',ylabel='Zero yield (%)',title='Latest curve — fixed initial-training AFNS parameters')
+    ax.legend();ax.grid(alpha=.3);fig.tight_layout();fig.savefig(out/'01_afns_latest_curve.png',dpi=150);plt.close(fig)
+    fig,ax=plt.subplots(figsize=(10,4.4))
+    ax.plot(TAUS,adj*1e4)
+    ax.axhline(0,color='gray',lw=.8)
+    ax.set(xlabel='Maturity (years)',ylabel='Adjustment (bps)',title='AFNS risk-neutral yield adjustment (estimated on training sample)')
+    ax.grid(alpha=.3);fig.tight_layout();fig.savefig(out/'02_afns_adjustment.png',dpi=150);plt.close(fig)
+    fig,ax=plt.subplots(figsize=(10,4.8))
+    for j,n in enumerate(['Level','Slope','Curvature']): ax.plot(idx,states[:,j]*100,label=n)
+    ax.axvline(train_end,color='black',lw=1,ls='--',label='Training ends')
+    ax.set(xlabel='Month',ylabel='Estimated factor (%)',title='Sequential Kalman-filtered states')
+    ax.legend();ax.grid(alpha=.25);fig.tight_layout();fig.savefig(out/'03_afns_filtered_factors.png',dpi=150);plt.close(fig)
+    fig,axs=plt.subplots(1,2,figsize=(11,4.4))
+    for ax,tenor in zip(axs,['10Y','30Y']):
+        block=metrics[metrics.tenor==tenor]
+        xx=np.arange(len(block));width=.34
+        ax.bar(xx-width/2,block.rw_rmse_bps,width,label='Random walk')
+        ax.bar(xx+width/2,block.afns_rmse_bps,width,label='AFNS')
+        ax.set_xticks(xx,[str(v)+'m' for v in block.horizon_months])
+        ax.set_title(tenor);ax.set_ylabel('RMSE (bps)');ax.legend()
+        ax.grid(alpha=.2,axis='y')
+    fig.suptitle('True later-month test: fixed-parameter AFNS versus random walk')
+    fig.tight_layout();fig.savefig(out/'04_oos_rmse_10Y_30Y.png',dpi=150);plt.close(fig)
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--input',type=Path,default=HERE/'project2_phase1_outputs'/'monthly_zero_yields_pct.csv')
+    ap.add_argument('--output',type=Path,default=HERE/'project2_phase4b_outputs')
+    ap.add_argument('--lambda-per-year',type=float,default=.25)
+    ap.add_argument('--maxiter',type=int,default=250)
+    args=ap.parse_args()
+    if args.lambda_per_year<=0: raise ValueError('lambda must be positive')
+    df,y=load_yields(args.input)
+    if len(y)<=TRAIN+6:raise ValueError('Insufficient OOS months')
+    out=args.output;out.mkdir(parents=True,exist_ok=True)
+    H=ns_loadings(TAUS,args.lambda_per_year)
+    basis=precompute_variance_basis(TAUS,args.lambda_per_year)
+    print('Fitting restricted AFNS state-space parameters on the first',TRAIN,'months...')
+    result,initial_nll=optimize_train(y[:TRAIN],H,basis,args.maxiter)
+    theta,kappa,sigma,omega,meas_sd=unpack(result.x)
+    _,train_states,train_fit,adj=kalman(result.x,y[:TRAIN],H,basis,True)
+    _,states,fit,adj=kalman(result.x,y,H,basis,True)
+    train_rmse=np.sqrt(np.mean((fit[:TRAIN]-y[:TRAIN])**2,axis=1))*1e4
+    test_rmse=np.sqrt(np.mean((fit[TRAIN:]-y[TRAIN:])**2,axis=1))*1e4
+    f=forecasting(y,states,result.x,H,adj,TRAIN)
+    m=scored(f)
+    f['origin_date']=df.index[f.origin_row.to_numpy()].strftime('%Y-%m-%d')
+    f['target_date']=df.index[f.target_row.to_numpy()].strftime('%Y-%m-%d')
+    f.to_csv(out/'phase4b_forecasts.csv',index=False)
+    m.to_csv(out/'phase4b_forecast_metrics.csv',index=False)
+    pd.DataFrame(states*100,index=df.index,columns=['level_pct','slope_pct','curvature_pct']).to_csv(out/'phase4b_filtered_factors.csv')
+    pd.DataFrame({'maturity_years':TAUS,'observed_pct':y[-1]*100,
+                  'afns_fitted_pct':fit[-1]*100,'adjustment_bps':adj*1e4}).to_csv(
+                      out/'phase4b_latest_curve.csv',index=False)
+    details={'train_start':str(df.index[0].date()),'train_end':str(df.index[TRAIN-1].date()),
+             'sample_end':str(df.index[-1].date()),'lambda_per_year':args.lambda_per_year,
+             'train_months':TRAIN,'months_total':len(y),'joint_ml_initial_nll':float(initial_nll),
+             'joint_ml_final_nll':float(result.fun),'converged':bool(result.success),
+             'status_message':str(result.message),'theta_p_pct':(theta*100).tolist(),
+             'kappa_p_per_year':kappa.tolist(),'Sigma_cholesky_annual':sigma.tolist(),
+             'Omega_eigenvalues':np.linalg.eigvalsh(omega).tolist(),
+             'measurement_noise_sd_bps':float(meas_sd*1e4),
+             'train_curve_fit_rmse_bps':float(train_rmse.mean()),
+             'test_curve_fit_rmse_bps':float(test_rmse.mean()),
+             'yield_adjustment_10y_bps':float(adj[9]*1e4),
+             'yield_adjustment_30y_bps':float(adj[29]*1e4)}
+    (out/'phase4b_parameters.json').write_text(json.dumps(details,indent=2))
+    make_plots(out,df,y,H,fit,states,adj,result.x,f,m)
+    lines=['='*72,'PHASE 4B — JOINT RESTRICTED AFNS / KALMAN MAXIMUM LIKELIHOOD',
+           '='*72,f'Train: {df.index[0].date()} to {df.index[TRAIN-1].date()} ({TRAIN} months)',
+           f'Out-of-sample: {df.index[TRAIN].date()} to {df.index[-1].date()}',
+           f'Optimizer converged: {result.success} | {result.message}',
+           f'Training NLL: {initial_nll:.3f} -> {result.fun:.3f}',
+           f'Measurement-noise SD: {meas_sd*1e4:.3f} bps',
+           f'P mean-reversion rates per year: {np.round(kappa,5)}',
+           f'Covariance eigenvalues: {np.linalg.eigvalsh(omega)}',
+           f'Mean in-sample filtered curve RMSE: {train_rmse.mean():.3f} bps',
+           f'Mean out-of-sample filtered curve RMSE: {test_rmse.mean():.3f} bps',
+           f'Q 10Y yield adjustment: {adj[9]*1e4:.3f} bps',
+           f'Q 30Y yield adjustment: {adj[29]*1e4:.3f} bps',
+           '\nOOS RMSE (bps), positive improvement means AFNS beats RW:',
+           m[m.tenor.isin(['10Y','30Y','ALL_30'])].round(3).to_string(index=False),
+           '\nLIMITATIONS: Restricted diagonal K_P, shared iid measurement noise, fixed lambda; ',
+           'one initial maximum-likelihood training fit, no later re-estimation; ',
+           'GSW fitted curves are not transaction prices; significance not tested; ',
+           'earlier research informed lambda (not an untouched hyperparameter holdout).',
+           '\nSaved files: 5 CSV/JSON tables, four charts, and this report.',
+           f'Output: {out.resolve()}']
+    report='\n'.join(lines)
+    print(report)
+    (out/'phase4b_report.txt').write_text(report)
+    if not result.success:
+        print('\nIMPORTANT: optimization did not report convergence. Increase --maxiter or investigate model identification.')
+
+
+if __name__=='__main__':
+    main()
